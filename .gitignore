@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.dwl
+*.dwl2
+*.fbx
+*_data.json
+.claude/
