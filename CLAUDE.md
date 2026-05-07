@@ -7,7 +7,7 @@
 ## 工作流
 
 ```
-CAD 绘图 (.dxf)  →  parse_dxf.py  →  data.json  →  build_from_json.py  →  Blender 3D
+CAD 绘图 (.dxf)  →  parse_dxf.py  →  data.json  →  build_from_json.py  →  Blender 3D  →  export_fbx.py  →  .fbx
 ```
 
 ### 1. 用户操作
@@ -26,6 +26,15 @@ python parse_dxf.py <图纸.dxf> [输出.json]
 import build_from_json
 build_from_json.build("路径/data.json")
 ```
+
+### 4. FBX 导出
+在 Blender 中执行：
+```python
+import export_fbx
+export_fbx.export("输出路径.fbx")                      # 默认导出 "Building" 父对象
+export_fbx.export("输出.fbx", building_name="Building") # 或指定父对象名
+```
+导出参数针对 3ds Max 优化（Z-up、单位缩放、四边形网格）。
 
 ## CAD 图层规范
 
