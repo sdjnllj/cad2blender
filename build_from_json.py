@@ -200,8 +200,196 @@ def build_column_mesh(center, wx, wy, height_mm):
 
 
 # =============================================================================
+#  窗框网格生成
+# =============================================================================
+
+def _extract_window_bars(lines_local, tol=2.0, max_bar_thick=200):
+    """用格栅法从窗框线段识别框料矩形区域。
+
+    以所有线端点坐标为切割线建格；
+    格子的最短边 ≤ max_bar_thick，且该短边两侧均有窗线部分覆盖 → 框料。
+    """
+    h_segs = []  # (y, x_min, x_max)
+    v_segs = []  # (x, y_min, y_max)
+
+    xs_set, ys_set = set(), set()
+    for seg in lines_local:
+        (x1, y1), (x2, y2) = seg[0], seg[1]
+        xs_set.update([round(x1), round(x2)])
+        ys_set.update([round(y1), round(y2)])
+        if abs(y2 - y1) < tol:
+            h_segs.append(((y1 + y2) / 2, min(x1, x2), max(x1, x2)))
+        elif abs(x2 - x1) < tol:
+            v_segs.append(((x1 + x2) / 2, min(y1, y2), max(y1, y2)))
+
+    xs = sorted(xs_set)
+    ys = sorted(ys_set)
+
+    def h_partial(y, cx1, cx2):
+        """y 处是否有 H 线部分覆盖 [cx1,cx2]"""
+        for (sy, xa, xb) in h_segs:
+            if abs(sy - y) < tol and xa < cx2 - tol and xb > cx1 + tol:
+                return True
+        return False
+
+    def v_partial(x, cy1, cy2):
+        """x 处是否有 V 线部分覆盖 [cy1,cy2]"""
+        for (sx, ya, yb) in v_segs:
+            if abs(sx - x) < tol and ya < cy2 - tol and yb > cy1 + tol:
+                return True
+        return False
+
+    bars = []
+    for ix in range(len(xs) - 1):
+        for iy in range(len(ys) - 1):
+            cx1, cx2 = xs[ix], xs[ix + 1]
+            cy1, cy2 = ys[iy], ys[iy + 1]
+            dx, dy = cx2 - cx1, cy2 - cy1
+            solid = False
+            # 薄竖条: 两侧 V 线都部分覆盖
+            if dx <= max_bar_thick:
+                if v_partial(cx1, cy1, cy2) and v_partial(cx2, cy1, cy2):
+                    solid = True
+            # 薄横条: 上下 H 线都部分覆盖
+            if dy <= max_bar_thick:
+                if h_partial(cy1, cx1, cx2) and h_partial(cy2, cx1, cx2):
+                    solid = True
+            if solid:
+                bars.append((cx1, cy1, cx2, cy2))
+
+    if not bars:
+        return bars
+
+    # --- 后处理 1: 合并同轴、间距 ≤ max_bar_thick 的相邻条 ---
+    # (修复外框竖条被横档 Y 切割导致的间断)
+    changed = True
+    while changed:
+        changed = False
+        result = []
+        used = [False] * len(bars)
+        for i, (ax1, ay1, ax2, ay2) in enumerate(bars):
+            if used[i]:
+                continue
+            for j in range(i + 1, len(bars)):
+                if used[j]:
+                    continue
+                bx1, by1, bx2, by2 = bars[j]
+                # 同 X 范围 → 尝试 Y 方向合并
+                if abs(ax1 - bx1) < 1 and abs(ax2 - bx2) < 1:
+                    gap = max(ay1, by1) - min(ay2, by2)
+                    if gap <= max_bar_thick:
+                        bars[i] = (ax1, min(ay1, by1), ax2, max(ay2, by2))
+                        ax1, ay1, ax2, ay2 = bars[i]
+                        used[j] = True
+                        changed = True
+                # 同 Y 范围 → 尝试 X 方向合并
+                elif abs(ay1 - by1) < 1 and abs(ay2 - by2) < 1:
+                    gap = max(ax1, bx1) - min(ax2, bx2)
+                    if gap <= max_bar_thick:
+                        bars[i] = (min(ax1, bx1), ay1, max(ax2, bx2), ay2)
+                        ax1, ay1, ax2, ay2 = bars[i]
+                        used[j] = True
+                        changed = True
+        bars = [b for k, b in enumerate(bars) if not used[k]]
+
+    # --- 后处理 2: 接触外边界的条延伸至整个外框范围 (填满四角) ---
+    ox1, ox2 = min(xs), max(xs)
+    oy1, oy2 = min(ys), max(ys)
+    extended = []
+    for (bx1, by1, bx2, by2) in bars:
+        orig_bx1, orig_by1, orig_bx2, orig_by2 = bx1, by1, bx2, by2
+        # 竖条接触左/右外边 → 延伸到全高
+        if abs(orig_bx1 - ox1) < 1 or abs(orig_bx2 - ox2) < 1:
+            by1, by2 = min(by1, oy1), max(by2, oy2)
+        # 横条接触底/顶外边 (用原始 Y 判断，不受上面 Y 延伸影响) → 延伸到全宽
+        if abs(orig_by1 - oy1) < 1 or abs(orig_by2 - oy2) < 1:
+            bx1, bx2 = min(bx1, ox1), max(bx2, ox2)
+        extended.append((bx1, by1, bx2, by2))
+
+    # --- 后处理 3: 竖框裁剪到横框之间，消除四角重叠面 ---
+    # 横框占全宽、竖框让位给横框（标准窗框做法）
+    inner_oy1 = ys[1]   # 底横框上边 Y
+    inner_oy2 = ys[-2]  # 顶横框下边 Y
+    final = []
+    for (bx1, by1, bx2, by2) in extended:
+        dx, dy = bx2 - bx1, by2 - by1
+        is_stile = (abs(bx1 - ox1) < 1 or abs(bx2 - ox2) < 1) and dy > dx
+        if is_stile:
+            by1 = max(by1, inner_oy1)
+            by2 = min(by2, inner_oy2)
+            if by2 <= by1:
+                continue
+        final.append((bx1, by1, bx2, by2))
+
+
+    return final
+
+
+
+
+
+def build_window_frame_meshes(win_lines_local, exterior_start, exterior_end,
+                              inward_normal, frame_offset_mm, frame_depth_mm):
+    """将窗框线段转换为 Blender 世界坐标的网格列表。
+
+    win_lines_local: [[[lx1,ly1],[lx2,ly2]], ...]  立面局部坐标 (mm)
+    frame_offset_mm: 窗框前脸距外立面偏移
+    frame_depth_mm:  窗框进深
+    返回 list of (verts, faces)  世界坐标 (m)
+    """
+    bars = _extract_window_bars(win_lines_local)
+    if not bars:
+        return []
+
+    sx, sy = exterior_start
+    ex, ey = exterior_end
+    wx, wy = ex - sx, ey - sy
+    dir_len = math.hypot(wx, wy)
+    if dir_len < 1e-6:
+        return []
+    wdx, wdy = wx / dir_len, wy / dir_len
+
+    in_len = math.hypot(inward_normal[0], inward_normal[1])
+    inx, iny = inward_normal[0] / in_len, inward_normal[1] / in_len
+
+    z0 = frame_offset_mm                   # 前脸 (距外立面 offset)
+    z1 = frame_offset_mm + frame_depth_mm  # 后脸
+
+    results = []
+    for (lx1, ly1, lx2, ly2) in bars:
+        def to_world(lx, ly, lz):
+            gx = sx + lx * wdx + lz * inx
+            gy = sy + lx * wdy + lz * iny
+            gz = ly
+            return (gx / 1000.0, gy / 1000.0, gz / 1000.0)
+
+        verts = [
+            to_world(lx1, ly1, z0),  # 0 前-左下
+            to_world(lx2, ly1, z0),  # 1 前-右下
+            to_world(lx2, ly2, z0),  # 2 前-右上
+            to_world(lx1, ly2, z0),  # 3 前-左上
+            to_world(lx1, ly1, z1),  # 4 后-左下
+            to_world(lx2, ly1, z1),  # 5 后-右下
+            to_world(lx2, ly2, z1),  # 6 后-右上
+            to_world(lx1, ly2, z1),  # 7 后-左上
+        ]
+        faces = [
+            (0, 3, 2, 1),  # 前脸 (朝外)
+            (4, 5, 6, 7),  # 后脸 (朝内)
+            (0, 1, 5, 4),  # 底面
+            (2, 3, 7, 6),  # 顶面
+            (0, 4, 7, 3),  # 左面
+            (1, 2, 6, 5),  # 右面
+        ]
+        results.append((list(verts), list(faces)))
+
+    return results
+
+
+# =============================================================================
 #  外立面法线计算
 # =============================================================================
+
 
 def compute_inward_normal(exterior_start, exterior_end, centroid):
     """返回墙体内法线方向 (nx, ny)，指向建筑重心那一侧。"""
@@ -372,8 +560,20 @@ def fix_normals(mesh, verts, faces, face_groups, inward_normal):
 #  Blender 对象创建
 # =============================================================================
 
-def create_mesh_object(verts, faces, name, parent=None):
-    """从顶点+面创建 Blender Mesh 对象。"""
+def get_or_create_material(name, color_rgba=(0.8, 0.8, 0.8, 1.0)):
+    """返回已有材质或新建一个带基础颜色的材质。"""
+    if name in bpy.data.materials:
+        return bpy.data.materials[name]
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes.get('Principled BSDF')
+    if bsdf:
+        bsdf.inputs['Base Color'].default_value = color_rgba
+    return mat
+
+
+def create_mesh_object(verts, faces, name, parent=None, material=None):
+    """从顶点+面创建 Blender Mesh 对象，并可选地赋予材质。"""
     if not verts:
         return None
     mesh = bpy.data.meshes.new(name)
@@ -383,7 +583,13 @@ def create_mesh_object(verts, faces, name, parent=None):
     mesh.update()
     if parent:
         obj.parent = parent
+    if material:
+        if len(obj.data.materials) == 0:
+            obj.data.materials.append(material)
+        else:
+            obj.data.materials[0] = material
     return obj
+
 
 
 # =============================================================================
@@ -399,6 +605,11 @@ def build(json_path):
     walls = data['walls']
     columns = data.get('columns', [])
     default_h = meta['default_height_mm']
+
+    # 窗框参数 (可在 meta.window_defaults 中覆盖)
+    win_defaults = meta.get('window_defaults', {})
+    FRAME_OFFSET = win_defaults.get('frame_offset_mm', 100)
+    FRAME_DEPTH  = win_defaults.get('frame_depth_mm',  60)
 
     print(f"[build] {len(walls)} walls, {len(columns)} columns, "
           f"default height: {default_h} mm")
@@ -422,6 +633,12 @@ def build(json_path):
     # --- 创建父级 ---
     parent = bpy.data.objects.new("Building", None)
     bpy.context.collection.objects.link(parent)
+
+    # --- 预建材质 ---
+    mat_wall   = get_or_create_material('Mat_Wall',   (0.75, 0.75, 0.72, 1.0))  # 浅灰
+    mat_window = get_or_create_material('Mat_Window', (0.55, 0.65, 0.75, 1.0))  # 浅蓝灰
+    print(f"[build] 材质: {mat_wall.name}, {mat_window.name}")
+
 
     # --- 墙体 ---
     for i, w in enumerate(walls):
@@ -452,7 +669,29 @@ def build(json_path):
             print(f"  {name}: plain, h={default_h}mm → {len(verts)}v {len(faces)}f "
                   f"({n_flip} flipped)")
 
-        create_mesh_object(verts, faces, name, parent)
+        create_mesh_object(verts, faces, name, parent, material=mat_wall)
+
+
+        # --- 窗框 ---
+        if 'elevation' in w and w['elevation']:
+            elev = w['elevation']
+            for win_entry in elev.get('windows', []):
+                oi = win_entry['opening_index']
+                win_lines = win_entry['lines']
+                frame_meshes = build_window_frame_meshes(
+                    win_lines, es, ee, inward,
+                    FRAME_OFFSET, FRAME_DEPTH
+                )
+                for bi, (wv, wf) in enumerate(frame_meshes):
+                    fix_simple_normals(wv, wf)
+                    wname = f"Win_{label}_o{oi}_b{bi}"
+                    create_mesh_object(wv, wf, wname, parent, material=mat_window)
+
+            if elev.get('windows'):
+                n_win = sum(len(build_window_frame_meshes(
+                    e['lines'], es, ee, inward, FRAME_OFFSET, FRAME_DEPTH
+                )) for e in elev['windows'])
+                print(f"    窗框: {len(elev['windows'])} 扇, {n_win} 个框料条")
 
     # --- 柱子 ---
     for i, c in enumerate(columns):
@@ -463,7 +702,8 @@ def build(json_path):
         n_flip = fix_simple_normals(verts, faces)
         print(f"  {name}: {wx}x{wy}x{default_h}mm → {len(verts)}v {len(faces)}f "
               f"({n_flip} flipped)")
-        create_mesh_object(verts, faces, name, parent)
+        create_mesh_object(verts, faces, name, parent, material=mat_wall)
+
 
     print("[build] done")
 

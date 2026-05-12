@@ -109,10 +109,68 @@ def extract_plan_walls(msp):
     return lines, labels
 
 
+def _group_lines_into_loops(lines, tol=1e-2):
+    """将 LINE 集合按端点连通性分组为若干闭合/开放链。
+    返回 list of (vertex_list, is_closed)。"""
+    if not lines:
+        return []
+    # 构建边列表（双向）
+    edges = list(lines)
+    used = [False] * len(edges)
+    loops = []
+
+    def find_next(tail):
+        for i, (s, e) in enumerate(edges):
+            if used[i]:
+                continue
+            if dist(tail, s) < tol:
+                return i, e
+            if dist(tail, e) < tol:
+                return i, s
+        return None, None
+
+    for start_i in range(len(edges)):
+        if used[start_i]:
+            continue
+        s0, e0 = edges[start_i]
+        chain = [s0, e0]
+        used[start_i] = True
+        while True:
+            next_i, next_pt = find_next(chain[-1])
+            if next_i is None:
+                break
+            used[next_i] = True
+            chain.append(next_pt)
+        is_closed = dist(chain[0], chain[-1]) < tol
+        if is_closed:
+            chain = chain[:-1]
+        loops.append((chain, is_closed))
+    return loops
+
+
+def _polygon_area(pts):
+    """Shoelace 公式计算多边形面积（绝对值）。"""
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    a = 0.0
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        a += x1 * y2 - x2 * y1
+    return abs(a) / 2.0
+
+
 def extract_elevation(msp, layer_name):
-    """从指定 Elev_* 层提取外轮廓(LINE)和洞口(LWPOLYLINE)。"""
-    outer_lines = []
-    holes = []
+    """从指定 Elev_* 层提取外轮廓和洞口。
+
+    LINE 实体：先按连通性分组成环；面积最大的闭合环 = 外轮廓，
+    其余闭合环 = 洞口（支持用 LINE 手画的矩形洞口）。
+    LWPOLYLINE 实体：始终视为洞口。
+    """
+    raw_lines = []
+    lwpoly_holes = []
+
     for e in msp:
         if e.dxf.layer != layer_name:
             continue
@@ -120,7 +178,7 @@ def extract_elevation(msp, layer_name):
             s = (e.dxf.start.x, e.dxf.start.y)
             ee = (e.dxf.end.x, e.dxf.end.y)
             if dist(s, ee) > 1e-3:
-                outer_lines.append((s, ee))
+                raw_lines.append((s, ee))
         elif e.dxftype() == 'LWPOLYLINE':
             pts_raw = list(e.vertices())
             pts_2d = [(p[0] if isinstance(p, tuple) else p.x,
@@ -128,10 +186,30 @@ def extract_elevation(msp, layer_name):
                       for p in pts_raw]
             if len(pts_2d) < 3:
                 continue
-            # 判断是否为闭合多段线
             if dist(pts_2d[0], pts_2d[-1]) < 1e-3:
-                pts_2d = pts_2d[:-1]  # 去重闭合点
-            holes.append(pts_2d)
+                pts_2d = pts_2d[:-1]
+            lwpoly_holes.append(pts_2d)
+
+    # 将 LINE 分组成闭合环
+    loops = _group_lines_into_loops(raw_lines)
+    closed_loops = [(pts, _polygon_area(pts)) for pts, is_closed in loops if is_closed]
+
+    outer_poly_pts = []
+    line_holes = []
+    if closed_loops:
+        # 面积最大的环 = 外轮廓
+        closed_loops.sort(key=lambda x: x[1], reverse=True)
+        outer_poly_pts = closed_loops[0][0]
+        # 其余闭合环 = 洞口（如用 LINE 手画的矩形窗洞）
+        line_holes = [pts for pts, _ in closed_loops[1:]]
+        # 将外轮廓转换为 lines_to_polygon 期望的 LINE 列表格式
+        n = len(outer_poly_pts)
+        outer_lines = [(outer_poly_pts[i], outer_poly_pts[(i + 1) % n]) for i in range(n)]
+    else:
+        # 没有完整闭合环（如外轮廓缺底边）→ 退回原逻辑，把所有 LINE 当外轮廓线
+        outer_lines = raw_lines
+
+    holes = line_holes + lwpoly_holes
     return outer_lines, holes
 
 
@@ -152,6 +230,20 @@ def extract_columns(msp):
                 pts_2d = pts_2d[:-1]
             columns.append(pts_2d)
     return columns
+
+
+def extract_windows(msp):
+    """从 Windows 层提取所有窗框线段。"""
+    lines = []
+    for e in msp:
+        if e.dxf.layer != 'Windows':
+            continue
+        if e.dxftype() == 'LINE':
+            s = (e.dxf.start.x, e.dxf.start.y)
+            end = (e.dxf.end.x, e.dxf.end.y)
+            if dist(s, end) > 1e-3:
+                lines.append((s, end))
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +407,7 @@ def process_elevation(outer_lines, holes):
     """
     outer_poly = lines_to_polygon(outer_lines)
     if not outer_poly:
-        return None, [], 0, 0
+        return None, [], 0, 0, (0.0, 0.0)
 
     # 计算立面尺寸
     xs = [p[0] for p in outer_poly]
@@ -328,7 +420,7 @@ def process_elevation(outer_lines, holes):
     outer_norm = [(p[0] - ox, p[1] - oy) for p in outer_poly]
     holes_norm = [[(p[0] - ox, p[1] - oy) for p in h] for h in holes]
 
-    return outer_norm, holes_norm, round(width, 1), round(height, 1)
+    return outer_norm, holes_norm, round(width, 1), round(height, 1), (round(ox, 2), round(oy, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -370,15 +462,78 @@ def parse_dxf(dxf_path):
         if not outer_lines and not holes:
             print(f"  {layer_name}: empty, skipping")
             continue
-        outer_poly, holes_polys, w, h = process_elevation(outer_lines, holes)
+        outer_poly, holes_polys, w, h, origin = process_elevation(outer_lines, holes)
         wall_id = layer_name.replace('Elev_', '')
         elevations[wall_id] = {
             'outer_contour': outer_poly,
             'openings': holes_polys,
             'width_mm': w,
             'height_mm': h,
+            '_abs_origin': origin,  # 仅内部使用，供窗户归属
         }
         print(f"  {layer_name}: {w}×{h} mm, {len(holes_polys)} openings")
+
+    # 4.5 提取并归属窗户 (Windows 图层)
+    window_lines = extract_windows(msp)
+    print(f"[parse] Windows: {len(window_lines)} lines")
+    if window_lines:
+        # 每个立面的绝对包围盒
+        elev_abs_boxes = {}
+        for wid, elev in elevations.items():
+            ox, oy = elev['_abs_origin']
+            elev_abs_boxes[wid] = (ox, oy, ox + elev['width_mm'], oy + elev['height_mm'])
+
+        # 按立面分组
+        elev_win_lines = defaultdict(list)
+        for s, e in window_lines:
+            mx = (s[0] + e[0]) / 2
+            my = (s[1] + e[1]) / 2
+            owner = None
+            for wid, (x1, y1, x2, y2) in elev_abs_boxes.items():
+                if x1 - 1 <= mx <= x2 + 1 and y1 - 1 <= my <= y2 + 1:
+                    owner = wid
+                    break
+            if owner:
+                elev_win_lines[owner].append((s, e))
+            else:
+                print(f"  [warn] 窗线中点({mx:.0f},{my:.0f}) 未落在任何立面范围内")
+
+        # 在每个立面内按洞口分组，转为局部坐标
+        for wid, wlines in elev_win_lines.items():
+            elev = elevations[wid]
+            ox, oy = elev['_abs_origin']
+            openings = elev['openings']
+            opening_bboxes = []
+            for hole in openings:
+                xs = [p[0] for p in hole]
+                ys = [p[1] for p in hole]
+                opening_bboxes.append((min(xs), min(ys), max(xs), max(ys)))
+
+            win_by_opening = defaultdict(list)
+            for s, e in wlines:
+                ls = (round(s[0] - ox, 2), round(s[1] - oy, 2))
+                le = (round(e[0] - ox, 2), round(e[1] - oy, 2))
+                lmx = (ls[0] + le[0]) / 2
+                lmy = (ls[1] + le[1]) / 2
+                assigned = -1
+                for oi, (bx1, by1, bx2, by2) in enumerate(opening_bboxes):
+                    if bx1 - 1 <= lmx <= bx2 + 1 and by1 - 1 <= lmy <= by2 + 1:
+                        assigned = oi
+                        break
+                win_by_opening[assigned].append([list(ls), list(le)])
+
+            windows_output = []
+            for oi, lines in sorted(win_by_opening.items()):
+                windows_output.append({
+                    'opening_index': oi,
+                    'lines': lines,
+                })
+                print(f"  {wid} 洞口[{oi}]: {len(lines)} 条窗框线")
+            elev['windows'] = windows_output
+
+    # 清理内部字段
+    for elev in elevations.values():
+        elev.pop('_abs_origin', None)
 
     # 5. 组装输出
     walls_output = []
